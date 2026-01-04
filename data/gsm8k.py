@@ -45,11 +45,11 @@ def load_and_prepare_dataset(data_file, tokenizer,
             labels_list.append(labels)
             attention_mask_list.append(attention_mask)
         
-            return {
-                "input_ids": input_ids_list,
-                "labels": labels_list,
-                "attention_mask": attention_mask_list,
-            }
+        return {
+            "input_ids": input_ids_list,
+            "labels": labels_list,
+            "attention_mask": attention_mask_list,
+        }
     
     def create_masked_labels(messages, tokenizer, input_ids, attention_mask):
         """Create labels with input tokens masked (-100)"""
