@@ -192,7 +192,10 @@ class JepaTrainer(Trainer):
                                 device=device)
             original_labels = torch.cat([original_labels, padding], dim=1)
         
-        doubled_labels = torch.cat([original_labels, original_labels], dim=0) # actually don't need to double labels because jepa loss don't use sft labels
+        # Batch 2 (JEPA) doesn't need LM loss, so mask all labels
+        jepa_labels = torch.full_like(original_labels, -100)
+        
+        doubled_labels = torch.cat([original_labels, jepa_labels], dim=0)  # Only batch 1 computes LM loss
         
         # Create attention masks for DOUBLED batch
         # Use max_len instead of seq_length since sequences may be longer now
@@ -330,9 +333,12 @@ class JepaTrainer(Trainer):
             if self.debug == 1 and torch.cuda.current_device() == 0:
                 print(f"predictor_embedding.shape: {predictor_embedding.shape}, step2_embedding.shape: {step2_embedding.shape}")
                 print(f"cosine_similarity.shape: {cosine_similarity.shape}")
-                print(f"index_predictor: {index_predictor}")
-                print(f"index_step2: {index_step2}")
-                print(f"cosine_similarity values: {cosine_similarity}")
+                print(f"index_predictor (per sample): {index_predictor}")
+                print(f"index_step2 (per sample): {index_step2}")
+                print(f"cosine_similarity values (per sample): {cosine_similarity}")
+                print(f"Are all index_predictor same? {torch.all(index_predictor == index_predictor[0])}")
+                print(f"Are all index_step2 same? {torch.all(index_step2 == index_step2[0])}")
+                print(f"Are all cosine_similarity same? {torch.all(cosine_similarity == cosine_similarity[0])}")
     
             # Compute total loss
             if self.jepa_l2:
@@ -367,6 +373,16 @@ class JepaTrainer(Trainer):
             exit(0)
 
         if self.debug == 5 and torch.cuda.current_device() == 0:
-            print(f"llm_loss: {lm_loss.float()}, jepa_loss: {jepa_loss.float()}")
+            if jepa_hidden_states is not None:
+                cosine_sim_mean = torch.mean(cosine_similarity).item()
+                cosine_sim_std = torch.std(cosine_similarity).item()
+                cosine_sim_min = torch.min(cosine_similarity).item()
+                cosine_sim_max = torch.max(cosine_similarity).item()
+                print(f"llm_loss: {lm_loss.float():.4f}, jepa_loss: {jepa_loss.float():.4f}")
+                print(f"  cosine_sim: mean={cosine_sim_mean:.4f}, std={cosine_sim_std:.4f}, min={cosine_sim_min:.4f}, max={cosine_sim_max:.4f}")
+                if cosine_sim_std < 1e-6:
+                    print(f"  WARNING: All samples have same cosine_similarity! index_predictor={index_predictor}, index_step2={index_step2}")
+            else:
+                print(f"llm_loss: {lm_loss.float():.4f}, jepa_loss: {jepa_loss.float():.4f}")
 
         return (total_loss, main_outputs) if return_outputs else total_loss
