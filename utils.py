@@ -1,6 +1,6 @@
 import os
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, LoraConfig, TaskType, get_peft_model
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 
 def setup_model_and_tokenizer(model_name, debug=0, seed=None, new_tokens=0):
     """Setup model and tokenizer"""
