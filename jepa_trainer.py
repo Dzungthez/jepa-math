@@ -318,16 +318,21 @@ class JepaTrainer(Trainer):
         
         # Get embeddings (using predictor position and step2 position)
         if jepa_hidden_states is not None:
-            index_predictor = self._step1_end_pos
-            index_step2 = self._step2_end_pos
-            predictor_embedding = jepa_hidden_states[range(num_items), index_predictor, :]
-            step2_embedding = jepa_hidden_states[range(num_items), index_step2, :]
+            # Use batch_size from jepa_hidden_states (already sliced from doubled batch)
+            batch_size = jepa_hidden_states.shape[0]
+            index_predictor = self._predictor_pos  # Position of last predictor token (after insertion)
+            index_step2 = self._step2_end_pos  # Position of step2 end (after insertion)
+            predictor_embedding = jepa_hidden_states[range(batch_size), index_predictor, :]
+            step2_embedding = jepa_hidden_states[range(batch_size), index_step2, :]
             
             # Compute cosine similarity
             cosine_similarity = F.cosine_similarity(predictor_embedding, step2_embedding, dim=-1)
             if self.debug == 1 and torch.cuda.current_device() == 0:
-                print(predictor_embedding.shape, step2_embedding.shape)
-                print(cosine_similarity.shape)
+                print(f"predictor_embedding.shape: {predictor_embedding.shape}, step2_embedding.shape: {step2_embedding.shape}")
+                print(f"cosine_similarity.shape: {cosine_similarity.shape}")
+                print(f"index_predictor: {index_predictor}")
+                print(f"index_step2: {index_step2}")
+                print(f"cosine_similarity values: {cosine_similarity}")
     
             # Compute total loss
             if self.jepa_l2:

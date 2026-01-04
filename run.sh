@@ -25,7 +25,7 @@ echo ""
 # =============================================================================
 
 # Data
-TRAIN_FILE="./gsm8k_step_jepa.jsonl"
+TRAIN_FILE="datasets/gsm8k_step_jepa.jsonl"
 OUTPUT_DIR="./checkpoints_adapted"
 
 # Model
@@ -78,7 +78,7 @@ CMD="python train.py \
   --batch_size=$BATCH_SIZE \
   --grad_accum=$GRAD_ACCUM \
   --max_length=$MAX_LENGTH \
-  --finetune_seed=$SEED \
+  --seed=$SEED \
   --debug=$DEBUG"
 
 # Add mode-specific flags
