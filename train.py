@@ -1,7 +1,7 @@
 import sys
 import os
 import torch
-from transformers import TrainingArguments, default_data_collator
+from transformers import TrainingArguments, DataCollatorForLanguageModeling, default_data_collator
 import argparse
 import shutil
 import math
@@ -45,6 +45,8 @@ def main():
     # Other
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--debug", type=int, default=5, help="Debug level")
+    parser.add_argument("--pretrain", action="store_true", help="Pretraining mode")
+    parser.add_argument("--same_flop", action="store_true", help="Adjust epochs/steps to match FLOPs")
     
     args = parser.parse_args()
     if torch.cuda.is_available():
@@ -186,8 +188,8 @@ def main():
         tf32=False,  # May help with stability
         
         # Set seed for reproducibility
-        seed=args.finetune_seed,
-        data_seed=args.finetune_seed,
+        seed=args.seed,
+        data_seed=args.seed,
     )
     if args.regular:
         if torch.cuda.current_device() == 0:
@@ -218,6 +220,7 @@ def main():
             jepa_mse=args.jepa_mse,
             infonce=args.infonce,
             jepa_ratio=args.jepa_ratio,
+            step_jepa_predictors=args.predictors,
         )
 
         trainable_params = []
