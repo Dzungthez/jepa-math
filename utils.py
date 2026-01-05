@@ -7,7 +7,6 @@ def setup_model_and_tokenizer(model_name, debug=0, seed=None, new_tokens=0):
     
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-    model.resize_token_embeddings(len(tokenizer))
     add_token = False
     if new_tokens > 0:
         special_tokens = [f"<|predictor_{i+1}|>" for i in range(new_tokens)]
@@ -46,9 +45,8 @@ def setup_model_and_tokenizer(model_name, debug=0, seed=None, new_tokens=0):
             low_cpu_mem_usage=True,
             use_cache=False,  # Disable KV cache for training
         )
-
+    model.resize_token_embeddings(len(tokenizer))
     if add_token:
-        model.resize_token_embeddings(len(tokenizer))
         if torch.cuda.current_device() == 0:
             print(f"Resized token embeddings to {len(tokenizer)}")
 
