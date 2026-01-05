@@ -47,8 +47,8 @@ class JepaTrainer(Trainer):
     def _find_step_boundaries(self, input_ids, labels, tokenizer):
         ids = input_ids.tolist()
         lab = labels.tolist()
-        print(f"lab: {lab}")
-        exit(0)
+        # print(f"lab: {lab}")
+        # exit(0)
         # assistant_start: first non-masked label token
         assistant_start = None
         for i, x in enumerate(lab):
@@ -236,10 +236,10 @@ class JepaTrainer(Trainer):
         self._step1_end_pos = step1_end_pos
         self._step2_end_pos = step2_end_pos + self.step_jepa_predictors  # Adjusted for inserted tokens
         self._predictor_pos = step1_end_pos + self.step_jepa_predictors  # Last predictor token
-        if self.debug == 5 and torch.cuda.current_device() == 0:
-            print(f">>>step1_end_pos<<< {self._step1_end_pos}")
-            print(f">>>step2_end_pos<<< {self._step2_end_pos}")
-            print(f">>>predictor_pos<<< {self._predictor_pos}")
+        # if self.debug == 5 and torch.cuda.current_device() == 0:
+        #     print(f">>>step1_end_pos<<< {self._step1_end_pos}")
+        #     print(f">>>step2_end_pos<<< {self._step2_end_pos}")
+        #     print(f">>>predictor_pos<<< {self._predictor_pos}")
         return {
             "input_ids": doubled_input_ids,      # Shape: (batch_size * 2, seq_len)
             "labels": doubled_labels,            # Shape: (batch_size * 2, seq_len)
