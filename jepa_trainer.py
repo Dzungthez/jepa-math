@@ -44,51 +44,44 @@ class JepaTrainer(Trainer):
         index_tensor = torch.tensor(index).to(input_ids.device)
         return index_tensor
     
-    def _find_step_boundaries(self, input_ids, processing_class):
-        """
-        Find positions of \n\n markers that represent step boundaries.
-        
-        In step-based reasoning, \n\n serves as THE representation point for each step.
-        We extract embeddings AT the \n\n position (not after it).
-        
-        Returns:
-            step1_end: Position of \n\n after Step 1 (last token if \n\n spans multiple tokens)
-            step2_end: Position of \n\n after Step 2 (last token if \n\n spans multiple tokens)
-            Returns None, None if can't find boundaries
-            
-        Note: Predictor tokens will be inserted RIGHT AFTER step1_end.
-        """
-        # Tokenize the separator - this is THE representation marker for each step
-        sep_tokens = processing_class.encode("\n\n", add_special_tokens=False)
-        
-        # Convert to list for searching
-        ids_list = input_ids.tolist()
-        
-        # Find first \n\n (THE representation point of Step 1)
-        step1_end = None
-        for i in range(len(ids_list) - len(sep_tokens) + 1):
-            if ids_list[i:i+len(sep_tokens)] == sep_tokens:
-                # Position of last token in \n\n sequence
-                # This is THE embedding extraction point for Step 1
-                step1_end = i + len(sep_tokens) - 1
+    def _find_step_boundaries(self, input_ids, labels, tokenizer):
+        ids = input_ids.tolist()
+        lab = labels.tolist()
+        print(f"lab: {lab}")
+        exit(0)
+        # assistant_start: first non-masked label token
+        assistant_start = None
+        for i, x in enumerate(lab):
+            if x != -100:
+                assistant_start = i
                 break
-        
-        if step1_end is None:
+        if assistant_start is None:
             return None, None
-        
-        # Find second \n\n (THE representation point of Step 2)
-        step2_end = None
-        for i in range(step1_end + len(sep_tokens), len(ids_list) - len(sep_tokens) + 1):
-            if ids_list[i:i+len(sep_tokens)] == sep_tokens:
-                # Position of last token in \n\n sequence
-                # This is THE embedding extraction point for Step 2
-                step2_end = i + len(sep_tokens) - 1
+
+        # assistant_end: last non-masked label token
+        assistant_end = None
+        for i in range(len(lab) - 1, -1, -1):
+            if lab[i] != -100:
+                assistant_end = i
                 break
-        
-        if step2_end is None:
+        if assistant_end is None or assistant_end <= assistant_start:
             return None, None
-        
-        return step1_end, step2_end
+
+        sep_tokens = tokenizer.encode("\n\n", add_special_tokens=False)
+        occ = []
+
+        # search only within assistant span
+        for i in range(assistant_start, assistant_end - len(sep_tokens) + 2):
+            if ids[i:i+len(sep_tokens)] == sep_tokens:
+                occ.append(i + len(sep_tokens) - 1)
+                if len(occ) >= 2:
+                    break
+
+        if len(occ) < 2:
+            return None, None
+
+        return occ[0], occ[1]
+
     
     def build_with_additive_mask(self, inputs):
         """
@@ -122,6 +115,7 @@ class JepaTrainer(Trainer):
         for i in range(batch_size):
             step1_end, step2_end = self._find_step_boundaries(
                 inputs["input_ids"][i],
+                inputs["labels"][i],
                 self.processing_class
             )
             
@@ -242,7 +236,10 @@ class JepaTrainer(Trainer):
         self._step1_end_pos = step1_end_pos
         self._step2_end_pos = step2_end_pos + self.step_jepa_predictors  # Adjusted for inserted tokens
         self._predictor_pos = step1_end_pos + self.step_jepa_predictors  # Last predictor token
-        
+        if self.debug == 5 and torch.cuda.current_device() == 0:
+            print(f">>>step1_end_pos<<< {self._step1_end_pos}")
+            print(f">>>step2_end_pos<<< {self._step2_end_pos}")
+            print(f">>>predictor_pos<<< {self._predictor_pos}")
         return {
             "input_ids": doubled_input_ids,      # Shape: (batch_size * 2, seq_len)
             "labels": doubled_labels,            # Shape: (batch_size * 2, seq_len)

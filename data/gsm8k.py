@@ -30,6 +30,7 @@ def load_and_prepare_dataset(data_file, tokenizer,
                 formatted_chat,
                 truncation=True,
                 max_length=max_length,
+                add_special_tokens=False,
                 padding="max_length",  # Pad to max_length for consistent tensor shapes
                 return_tensors=None
             )
@@ -53,7 +54,7 @@ def load_and_prepare_dataset(data_file, tokenizer,
     
     def create_masked_labels(messages, tokenizer, input_ids, attention_mask):
         """Create labels with input tokens masked (-100)"""
-        labels = [-100] * len(input_ids)
+        labels = [-100] * len(input_ids)        
         
         # Mask padding tokens in labels
         for i, mask in enumerate(attention_mask):
@@ -66,14 +67,19 @@ def load_and_prepare_dataset(data_file, tokenizer,
                 assistant_content = msg['content']
                 
                 # Find where this assistant response appears in the tokenized text
-                assistant_tokens = tokenizer.encode(assistant_content, add_special_tokens=False)
+                # assistant_tokens = tokenizer.encode(assistant_content, add_special_tokens=False)
+                assistant_with_eot = assistant_content + tokenizer.eos_token
+                assistant_tokens = tokenizer.encode(assistant_with_eot, add_special_tokens=False)
                 
                 # Find the position of assistant response in input_ids
                 decoded_assistant = [tokenizer.decode(item) for item in assistant_tokens]
                 decoded_input = [tokenizer.decode(item) for item in input_ids]
+
+                # print(f"decoded_input: {decoded_input}")
+                # print(f"decoded_assistant: {decoded_assistant}")
                 for i in range(len(input_ids) - len(assistant_tokens) + 1):
                     # Only check non-padding tokens
-                    if debug == 4 and torch.cuda.current_device() == 0:
+                    if debug == 4:
                         print(f"=======input_ids: {input_ids[i:i+len(assistant_tokens)]}")
                         print(f"assistant_tokens: {assistant_tokens}")
                     # if attention_mask[i] == 1 and input_ids[i:i+len(assistant_tokens)] == assistant_tokens:
@@ -86,7 +92,11 @@ def load_and_prepare_dataset(data_file, tokenizer,
                 
                 if debug == 4:
                     exit(0)
-        
+        # print(f"messages: {messages}")
+        # print(f"input_ids: {input_ids}")
+        # print(f"attention_mask: {attention_mask}")
+        # print(f"labels: {labels}")
+        # exit(0)
         return labels
     
     # Tokenize dataset

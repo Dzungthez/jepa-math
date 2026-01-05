@@ -6,6 +6,8 @@ def setup_model_and_tokenizer(model_name, debug=0, seed=None, new_tokens=0):
     """Setup model and tokenizer"""
     
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+    model.resize_token_embeddings(len(tokenizer))
     add_token = False
     if new_tokens > 0:
         special_tokens = [f"<|predictor_{i+1}|>" for i in range(new_tokens)]

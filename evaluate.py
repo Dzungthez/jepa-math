@@ -8,10 +8,10 @@ from transformers import AutoTokenizer
 
 
 # Configuration parameters
-DEFAULT_MODEL_PATH = "./checkpoints_adapted"
-DEFAULT_TEST_FILE = "../datasets/gsm8k_test.jsonl"
+DEFAULT_MODEL_PATH = "./checkpoints_sft/checkpoint-1287"
+DEFAULT_TEST_FILE = "datasets/gsm8k_test.jsonl"
 DEFAULT_OUTPUT_FILE = "./evaluation_results.jsonl"
-DEFAULT_MAX_NEW_TOKENS = 1536
+DEFAULT_MAX_NEW_TOKENS = 2048
 DEFAULT_TEMPERATURE = 0.0  # Greedy decoding
 
 
@@ -149,11 +149,12 @@ def prepare_prompts(test_data, tokenizer):
     all_prompts = []
     ground_truths = []
     questions = []
-    
+    new_system_prompt = "Please solve the problem step by step (separate steps with double newlines), but keep it short and put your final answer (do not include any other text or units) within \\boxed{}."
     for example in test_data:
         messages = example["messages"]
         ground_truth = messages[-1]["content"]
         input_messages = messages[:-1]  # Exclude assistant's answer
+        input_messages[0]["content"] = new_system_prompt
         
         prompt = tokenizer.apply_chat_template(
             input_messages,
