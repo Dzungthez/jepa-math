@@ -173,6 +173,14 @@ def main():
             args.num_epochs = int(math.ceil(args.num_epochs / 3))
         if torch.cuda.current_device() == 0:
             print(f">>>>> --same_flop is active: Save checkpoint every: {save_steps} steps, run {args.num_epochs} epochs")
+    
+    # Ensure save_steps is a multiple of eval_steps when load_best_model_at_end is enabled
+    if eval_dataset:
+        # Make save_steps a multiple of eval_steps
+        save_steps = max(eval_steps, (save_steps // eval_steps) * eval_steps)
+        if torch.cuda.current_device() == 0:
+            print(f">>>>> Adjusted save_steps to {save_steps} (multiple of eval_steps={eval_steps})")
+    
     output_dir = os.path.abspath(args.output_dir)
     if torch.cuda.current_device() == 0:
         shutil.rmtree(output_dir, ignore_errors=True)
@@ -191,8 +199,8 @@ def main():
         max_steps=args.max_train_steps if use_max_steps else -1,
         
         # Evaluation
-        eval_strategy="no",  # "steps" if eval_dataset else "no",
-        # eval_steps=eval_steps,
+        eval_strategy="steps" if eval_dataset else "no",
+        eval_steps=eval_steps if eval_dataset else None,
         
         # Saving
         save_strategy="steps",

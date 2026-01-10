@@ -78,20 +78,40 @@ class JepaTrainer(Trainer):
         if assistant_span is not None:
             assistant_start, assistant_end = assistant_span
         else:
-            # Fallback: find from labels
+            # Fallback: detect assistant boundary from chat template markers
+            # This is robust even when unmask_user=True (doesn't rely on labels)
+
+            # Debug warning when fallback is triggered
+            if self.debug >= 3 and torch.cuda.current_device() == 0:
+                print(f"WARNING: Using fallback boundary detection (metadata missing)")
+                if self.unmask_user:
+                    print(f"         unmask_user=True detected, using chat template markers")
+
+            # 1. Find assistant header in input_ids
+            assistant_header = "<|start_header_id|>assistant<|end_header_id|>\n\n"
+            assistant_header_ids = tokenizer.encode(assistant_header, add_special_tokens=False)
+
             assistant_start = None
-            for i, x in enumerate(lab):
-                if x != -100:
-                    assistant_start = i
+            for i in range(len(ids) - len(assistant_header_ids) + 1):
+                if ids[i:i+len(assistant_header_ids)] == assistant_header_ids:
+                    # Position after header = assistant content start
+                    assistant_start = i + len(assistant_header_ids)
                     break
+
             if assistant_start is None:
+                # Could not find assistant header, unsafe to proceed
+                if self.debug >= 3 and torch.cuda.current_device() == 0:
+                    print(f"WARNING: Could not find assistant header in fallback, returning None")
                 return None
 
+            # 2. Find assistant end (last non-padding token)
             assistant_end = None
-            for i in range(len(lab) - 1, -1, -1):
-                if lab[i] != -100:
+            for i in range(len(ids) - 1, -1, -1):
+                # Check if this is a real token (not padding)
+                if ids[i] != tokenizer.pad_token_id:
                     assistant_end = i
                     break
+
             if assistant_end is None or assistant_end <= assistant_start:
                 return None
 
@@ -535,7 +555,7 @@ class JepaTrainer(Trainer):
 
             # BATCH 3: Localized step masks
             boundaries = all_step_boundaries[i]
-            tripled_mask[i + 2*batch_size, 0, :, :] = \
+            tripled_mask[i + 2*batch_size, 0, :seq_len, :seq_len] = \
                 self._build_localized_step_masks(boundaries, seq_len)
 
         # Store metadata for loss computation
@@ -774,7 +794,7 @@ class JepaTrainer(Trainer):
                 cosine_sim_std = torch.std(cosine_similarity).item()
                 cosine_sim_min = torch.min(cosine_similarity).item()
                 cosine_sim_max = torch.max(cosine_similarity).item()
-                print(f"llm_loss: {lm_loss.float():.4f}, jepa_loss: {jepa_loss.float():.4f}")
+                print(f"llm_loss: {lm_loss}, jepa_loss: {jepa_loss}")
                 print(f"  cosine_sim: mean={cosine_sim_mean:.4f}, std={cosine_sim_std:.4f}, min={cosine_sim_min:.4f}, max={cosine_sim_max:.4f}")
                 if self.num_prediction_steps > 1:
                     print(f"  num_prediction_pairs: {total_pairs}")
@@ -783,6 +803,6 @@ class JepaTrainer(Trainer):
                     index_view2 = self._view2_end_pos
                     print(f"  WARNING: All samples have same cosine_similarity! index_predictor={index_predictor}, index_view2={index_view2}")
             else:
-                print(f"llm_loss: {lm_loss.float():.4f}, jepa_loss: {jepa_loss.float():.4f}")
+                print(f"llm_loss: {lm_loss}, jepa_loss: {jepa_loss}")
 
         return (total_loss, main_outputs) if return_outputs else total_loss

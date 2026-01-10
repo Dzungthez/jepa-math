@@ -52,8 +52,8 @@ def load_and_prepare_dataset(data_file, tokenizer,
     
     # Load dataset
     dataset = load_dataset('json', data_files=data_file)['train']
-    if  torch.cuda.current_device() == 0:
-        print(f"Loaded {len(dataset)} examples from {data_file}")
+    # if  torch.cuda.current_device() == 0:
+    print(f"Loaded {len(dataset)} examples from {data_file}")
     
     def tokenize_conversations(examples, unmask_user=False):
         """Tokenize conversations and mask input tokens properly"""
