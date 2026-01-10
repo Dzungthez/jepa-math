@@ -25,3 +25,5 @@ Khi training, tất cả samples trong batch có cùng `index_predictor` và `in
 2. Sau khi tokenize, các vị trí có bị align lại không?
 3. Có phải do padding làm cho các vị trí giống nhau không?
 
+
+
