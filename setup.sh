@@ -2,7 +2,7 @@ echo "!!!DO NOT run this script directly. Pick the right configuration and run e
 exit(0)
 
 # Common Packages
-pip install transformers datasets accelerate tqdm peft protobuf sentencepiece matplotlib scikit-learn
+pip install transformers datasets accelerate tqdm peft protobuf sentencepiece matplotlib scikit-learn numpy==2.2
 
 # For Nvidia Driver Version: 570.124.06
 #   torch==2.7.0+cu126 transformers==4.55.2 peft==0.17.0 numpy==2.2.6

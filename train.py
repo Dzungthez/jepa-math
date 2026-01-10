@@ -22,18 +22,21 @@ def main():
     parser.add_argument("--output_dir", type=str, default="./checkpoints_step_jepa_adapted", help="Output directory")
     
     # Training arguments
-    parser.add_argument("--max_length", type=int, default=1024, help="Maximum sequence length")
+    parser.add_argument("--max_length", type=int, default=2048, help="Maximum sequence length")
     parser.add_argument("--batch_size", type=int, default=4, help="Per device batch size")
     parser.add_argument("--grad_accum", type=int, default=4, help="Gradient accumulation steps")
-    parser.add_argument("--learning_rate", type=float, default=2e-5, help="Learning rate")
-    parser.add_argument("--num_epochs", type=int, default=3, help="Number of training epochs")
+    parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate")
+    parser.add_argument("--num_epochs", type=int, default=1, help="Number of training epochs")
     parser.add_argument("--eval_steps", type=int, default=50, help="Evaluation steps")
+    parser.add_argument("--max_train_steps", type=int, default=-1,
+                    help="Total number of training steps to perform. If > 0, overrides num_epochs.")
+
     
     # Step-JEPA arguments
     parser.add_argument("--step_jepa", action="store_true", help="Enable Step-JEPA mode (isolate Step 2)")
     parser.add_argument("--regular", action="store_true", help="Use regular trainer (SFT) without JEPA")
-    parser.add_argument("--predictors", type=int, default=1, help="Number of K predictor tokens after Step 1")
-    parser.add_argument("--lbd", type=float, default=0.1, help="Lambda for JEPA loss")
+    parser.add_argument("--predictors", type=int, default=4, help="Number of K predictor tokens after Step 1")
+    parser.add_argument("--lbd", type=float, default=0.5, help="Lambda for JEPA loss")
     parser.add_argument("--gamma", type=float, default=1.0, help="Gamma for LM loss")
     parser.add_argument("--last_token", type=int, default=-1, help="Index of last token for embedding extraction")
     parser.add_argument("--jepa_l2", action="store_true", help="Use L2 norm as JEPA loss")
@@ -41,7 +44,15 @@ def main():
     parser.add_argument("--infonce", action="store_true", help="Use InfoNCE loss")
     parser.add_argument("--jepa_ratio", type=float, default=-1.0, help="Random JEPA loss dropout ratio")
     parser.add_argument("--additive_mask", type = bool, default=True, help="Use additive mask")
-    
+    parser.add_argument("--unmask_user", action="store_true",
+                       help="Enable LM loss on user content (in addition to assistant)")
+    parser.add_argument("--view_based_jepa", action="store_true",
+                       help="Use view-based JEPA (user_end vs assistant_end) instead of step-based")
+    parser.add_argument("--num_prediction_steps", type=int, default=1,
+                       help="Number of consecutive step pairs to predict (default=1). "
+                            "Use 1 for current behavior, >1 for multi-step JEPA. "
+                            "Incompatible with --view_based_jepa.")
+
     # Other
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--debug", type=int, default=5, help="Debug level")
@@ -49,6 +60,14 @@ def main():
     parser.add_argument("--same_flop", action="store_true", help="Adjust epochs/steps to match FLOPs")
     
     args = parser.parse_args()
+
+    # Validate incompatible flags
+    if args.view_based_jepa and args.num_prediction_steps > 1:
+        raise ValueError(
+            "Cannot use both --view_based_jepa and --num_prediction_steps > 1. "
+            "Multi-step JEPA requires step boundaries, which view-based mode doesn't have."
+        )
+
     if torch.cuda.is_available():
         world_size = int(os.environ.get('WORLD_SIZE', 1))
         if world_size == 1:
@@ -68,8 +87,11 @@ def main():
     if not args.regular:
         print(f"Lambda (JEPA): {args.lbd}")
         print(f"Gamma (LM): {args.gamma}")
-        print(f"Last token: {args.last_token}")
+        print(f"Unmask user content: {args.unmask_user}")
+        print(f"JEPA mode: {'View-based' if args.view_based_jepa else 'Step-based'}")
+        print(f"Number of prediction steps: {args.num_prediction_steps}")
         print(f"Predictors (K): {args.predictors}")
+        print(f"Last token: {args.last_token}")
         if args.step_jepa:
             print(f"Step-JEPA: Isolate Step 2, K={args.predictors} tokens after Step 1")
 
@@ -89,14 +111,16 @@ def main():
             args.train_file,
             tokenizer,
             max_length=args.max_length,
-            debug=args.debug
+            debug=args.debug,
+            unmask_user=args.unmask_user
         )
         if args.eval_file is not None:
             eval_dataset = load_and_prepare_dataset(
                 args.eval_file,
                 tokenizer,
                 max_length=args.max_length,
-                debug=args.debug
+                debug=args.debug,
+                unmask_user=args.unmask_user
             )
         else:
             eval_dataset = None
@@ -108,7 +132,8 @@ def main():
             args.full_data_file,
             tokenizer,
             max_length=args.max_length,
-            debug=args.debug
+            debug=args.debug,
+            unmask_user=args.unmask_user
         )
         #seed = args.seed
         train_dataset, eval_dataset = full_dataset.train_test_split(test_size=0.1, seed=args.seed)
@@ -117,10 +142,25 @@ def main():
             print(f"Loaded {len(eval_dataset)} examples for evaluation")
     print("\n3. Loading dataset done")
 
-    data_collator = default_data_collator
+    steps_per_epoch = len(train_dataset) // (world_size * args.batch_size * args.grad_accum)
+    if steps_per_epoch == 0:
+        steps_per_epoch = 1
+
+    use_max_steps = args.max_train_steps is not None and args.max_train_steps > 0
+    if use_max_steps and torch.cuda.current_device() == 0:
+        print(f">>>>> Using max_train_steps={args.max_train_steps} (overrides num_epochs={args.num_epochs})")
+        print(f">>>>> steps_per_epoch = {steps_per_epoch}")
+
+    if args.regular:
+        data_collator = DataCollatorForLanguageModeling(
+            tokenizer=tokenizer,
+            mlm=False  # Causal LM, not masked LM
+        )
+    else:
+        data_collator = default_data_collator
 
     eval_steps = args.eval_steps if not args.pretrain else args.eval_steps * 20
-    save_steps = len(train_dataset) // (world_size * args.batch_size * args.grad_accum)
+    save_steps = steps_per_epoch
     if args.same_flop:
         if args.jepa_ratio > 0.0:
             save_steps = int(save_steps / (1 + args.jepa_ratio))
@@ -147,7 +187,8 @@ def main():
         per_device_eval_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.learning_rate,
-        num_train_epochs=args.num_epochs,
+        num_train_epochs=1 if use_max_steps else args.num_epochs,
+        max_steps=args.max_train_steps if use_max_steps else -1,
         
         # Evaluation
         eval_strategy="no",  # "steps" if eval_dataset else "no",
@@ -181,7 +222,7 @@ def main():
         
         # Other
         report_to="none",
-        remove_unused_columns=False,
+        remove_unused_columns=True if args.regular else False,
         load_best_model_at_end=True if eval_dataset else False,
         
         # Disable problematic optimizations
@@ -221,6 +262,9 @@ def main():
             infonce=args.infonce,
             jepa_ratio=args.jepa_ratio,
             step_jepa_predictors=args.predictors,
+            unmask_user=args.unmask_user,
+            view_based_jepa=args.view_based_jepa,
+            num_prediction_steps=args.num_prediction_steps,
         )
 
         trainable_params = []
