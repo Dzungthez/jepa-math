@@ -427,16 +427,35 @@ class JepaTrainer(Trainer):
 
             if boundaries is None or len(boundaries) < 2:
                 # Fallback: create boundaries at equal intervals
+                # But respect the actual number of steps in the sample
+
+                # First, count actual "\n\n" separators in the sample
+                ids = inputs["input_ids"][i].tolist()
+                sep_tokens = self.processing_class.encode("\n\n", add_special_tokens=False)
+
+                # Count all "\n\n" in sequence (not limited by num_steps)
+                actual_separators = 0
+                for j in range(len(ids) - len(sep_tokens) + 1):
+                    if ids[j:j+len(sep_tokens)] == sep_tokens:
+                        actual_separators += 1
+
+                # Actual steps = separators + 1 (if we have separators)
+                # But we can only form (actual_separators) pairs from (actual_separators+1) steps
+                # e.g., 8 separators → 9 steps → 8 pairs max
+                max_possible_pairs = actual_separators if actual_separators > 0 else 1
+
+                # Create only as many boundaries as we need
+                num_boundaries_to_create = min(self.num_prediction_steps + 1, max_possible_pairs + 1)
+
                 last_token = self._last_token_index(
                     inputs["input_ids"][i:i+1],
                     inputs["labels"][i:i+1],
                     inputs["attention_mask"][i:i+1]
                 )[0].item()
 
-                # Divide sequence into num_prediction_steps + 1 parts
-                num_parts = self.num_prediction_steps + 1
-                boundaries = [last_token * (j+1) // (num_parts + 1)
-                             for j in range(self.num_prediction_steps + 1)]
+                # Divide sequence into num_boundaries_to_create parts
+                boundaries = [last_token * (j+1) // (num_boundaries_to_create + 1)
+                             for j in range(num_boundaries_to_create)]
 
             # Actual number of pairs = len(boundaries) - 1
             num_pairs = len(boundaries) - 1
