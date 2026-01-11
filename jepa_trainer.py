@@ -17,6 +17,7 @@ class JepaTrainer(Trainer):
         self.unmask_user = kwargs.pop('unmask_user', False)
         self.view_based_jepa = kwargs.pop('view_based_jepa', False)
         self.num_prediction_steps = kwargs.pop('num_prediction_steps', 1)
+        self.use_localized_masks = kwargs.pop('use_localized_masks', True)
 
         assert self.jepa_l2 + self.jepa_mse <= 1, "Only one of jepa_l2 and jepa_mse can be True."
 
@@ -189,6 +190,7 @@ class JepaTrainer(Trainer):
 
                 if view1_end is None or view2_end is None:
                     # Fallback strategy for view-based
+                    print(f"Fallback to sequence thirds for view-based mode")
                     last_token = self._last_token_index(
                         inputs["input_ids"][i:i+1],
                         inputs["labels"][i:i+1],
@@ -333,6 +335,167 @@ class JepaTrainer(Trainer):
             "input_ids": doubled_input_ids,      # Shape: (batch_size * 2, seq_len)
             "labels": doubled_labels,            # Shape: (batch_size * 2, seq_len)
             "attention_mask": mask,              # Shape: (batch_size * 2, 1, seq_len, seq_len)
+        }, False
+
+    def _build_double_batch_no_isolation(self, inputs, user_spans, assistant_spans):
+        """
+        Double batch for single-step prediction WITHOUT view2 isolation.
+
+        Batch 1: LM loss (original sequences, normal causal)
+        Batch 2: Predictors inserted (normal causal for entire sequence, including view2)
+
+        This is simpler than isolated view2 - view2 can see full causal context.
+        """
+        batch_size = inputs["input_ids"].shape[0]
+        device = inputs["input_ids"].device
+
+        # Find view boundaries
+        view1_end_pos = []
+        view2_end_pos = []
+
+        for i in range(batch_size):
+            user_span = None
+            assistant_span = None
+            if user_spans is not None:
+                user_span = (user_spans[i][0].item(), user_spans[i][1].item())
+            if assistant_spans is not None:
+                assistant_span = (assistant_spans[i][0].item(), assistant_spans[i][1].item())
+
+            # Find view boundaries (reuse existing logic)
+            if self.view_based_jepa:
+                view1_end, view2_end = self._find_view_boundaries(
+                    inputs["input_ids"][i],
+                    inputs["labels"][i],
+                    user_span=user_span,
+                    assistant_span=assistant_span
+                )
+
+                if view1_end is None or view2_end is None:
+                    # Fallback strategy for view-based
+                    last_token = self._last_token_index(
+                        inputs["input_ids"][i:i+1],
+                        inputs["labels"][i:i+1],
+                        inputs["attention_mask"][i:i+1]
+                    )[0].item()
+                    view1_end = last_token // 2
+                    view2_end = last_token
+            else:
+                # Step-based mode
+                boundaries = self._find_step_boundaries(
+                    inputs["input_ids"][i],
+                    inputs["labels"][i],
+                    self.processing_class,
+                    user_span=user_span,
+                    assistant_span=assistant_span,
+                    num_steps=2
+                )
+
+                if boundaries is not None:
+                    view1_end = boundaries[0]
+                    view2_end = boundaries[1]
+                else:
+                    # Fallback to sequence thirds
+                    last_token = self._last_token_index(
+                        inputs["input_ids"][i:i+1],
+                        inputs["labels"][i:i+1],
+                        inputs["attention_mask"][i:i+1]
+                    )[0].item()
+                    view1_end = last_token // 3
+                    view2_end = (last_token * 2) // 3
+
+            view1_end_pos.append(view1_end)
+            view2_end_pos.append(view2_end)
+
+        # === BATCH 1: LM Loss ===
+        batch1_input_ids = inputs["input_ids"]
+        batch1_labels = inputs["labels"]
+
+        # === BATCH 2: Insert predictors ===
+        batch2_input_ids_list = []
+
+        for i in range(batch_size):
+            view1_end = view1_end_pos[i]
+            original_seq = inputs["input_ids"][i]
+
+            # Insert K predictor tokens after view1
+            predictor_ids = [
+                self.processing_class.convert_tokens_to_ids(f"<|predictor_{j+1}|>")
+                for j in range(self.step_jepa_predictors)
+            ]
+            predictor_tensor = torch.tensor(predictor_ids, device=device)
+
+            # Split and insert
+            new_seq = torch.cat([
+                original_seq[:view1_end+1],
+                predictor_tensor,
+                original_seq[view1_end+1:]
+            ])
+
+            batch2_input_ids_list.append(new_seq)
+
+        # Pad batch2 sequences
+        max_len_batch2 = max(seq.shape[0] for seq in batch2_input_ids_list)
+        batch2_input_ids = torch.full(
+            (batch_size, max_len_batch2),
+            self.processing_class.pad_token_id,
+            device=device
+        )
+        for i, seq in enumerate(batch2_input_ids_list):
+            batch2_input_ids[i, :seq.shape[0]] = seq
+
+        # Batch2 labels: all masked
+        batch2_labels = torch.full((batch_size, max_len_batch2), -100, device=device)
+
+        # === Pad both batches to same max_length ===
+        max_len = max(batch1_input_ids.shape[1], batch2_input_ids.shape[1])
+
+        def pad_to_length(tensor, target_len, pad_value):
+            if tensor.shape[1] < target_len:
+                padding = torch.full(
+                    (tensor.shape[0], target_len - tensor.shape[1]),
+                    pad_value,
+                    device=device
+                )
+                return torch.cat([tensor, padding], dim=1)
+            return tensor
+
+        batch1_input_ids = pad_to_length(batch1_input_ids, max_len, self.processing_class.pad_token_id)
+        batch1_labels = pad_to_length(batch1_labels, max_len, -100)
+        batch2_input_ids = pad_to_length(batch2_input_ids, max_len, self.processing_class.pad_token_id)
+        batch2_labels = pad_to_length(batch2_labels, max_len, -100)
+
+        # === Create attention masks (NORMAL CAUSAL for entire batch 2) ===
+        doubled_mask = torch.full((batch_size * 2, 1, max_len, max_len), float('-inf')).to(device)
+
+        for i in range(batch_size):
+            last_token = self._last_token_index(
+                inputs["input_ids"][i:i+1],
+                inputs["labels"][i:i+1],
+                inputs["attention_mask"][i:i+1]
+            )[0].item()
+
+            # BATCH 1: Normal causal
+            seq_len = last_token + 1
+            doubled_mask[i, 0, :seq_len, :seq_len] = self._build_additive_mask(seq_len)
+
+            # BATCH 2: Normal causal (with predictors) - NO ISOLATION
+            seq_len_with_pred = seq_len + self.step_jepa_predictors
+            doubled_mask[i + batch_size, 0, :seq_len_with_pred, :seq_len_with_pred] = \
+                self._build_additive_mask(seq_len_with_pred)
+
+        # Store metadata for loss computation
+        self._view1_end_pos = torch.tensor(view1_end_pos, device=device)
+        self._view2_end_pos = torch.tensor(view2_end_pos, device=device) + self.step_jepa_predictors
+        self._predictor_pos = torch.tensor(view1_end_pos, device=device) + self.step_jepa_predictors
+
+        # Double batch
+        doubled_input_ids = torch.cat([batch1_input_ids, batch2_input_ids], dim=0)
+        doubled_labels = torch.cat([batch1_labels, batch2_labels], dim=0)
+
+        return {
+            "input_ids": doubled_input_ids,
+            "labels": doubled_labels,
+            "attention_mask": doubled_mask,
         }, False
 
     def _build_localized_step_masks(self, step_boundaries, seq_length):
@@ -592,13 +755,190 @@ class JepaTrainer(Trainer):
             "attention_mask": tripled_mask,      # Shape: (batch_size * 3, 1, seq_len, seq_len)
         }, False
 
+    def _build_double_batch_multistep(self, inputs, user_spans, assistant_spans):
+        """
+        Double batch for multi-step prediction WITHOUT localized masks.
+
+        Batch 1: LM loss (original sequences, normal causal)
+        Batch 2: Predictors inserted (normal causal for both predictor and target embeddings)
+
+        This is more efficient than triple batch (2x vs 3x memory) but target embeddings
+        see full causal context instead of being isolated to their step.
+        """
+        batch_size = inputs["input_ids"].shape[0]
+        device = inputs["input_ids"].device
+
+        # === Find step boundaries (same as triple batch) ===
+        all_step_boundaries = []
+        num_pairs_per_sample = []
+
+        for i in range(batch_size):
+            user_span = None
+            assistant_span = None
+            if user_spans is not None:
+                user_span = (user_spans[i][0].item(), user_spans[i][1].item())
+            if assistant_spans is not None:
+                assistant_span = (assistant_spans[i][0].item(), assistant_spans[i][1].item())
+
+            # Find boundaries (reuse existing logic)
+            boundaries = self._find_step_boundaries(
+                inputs["input_ids"][i],
+                inputs["labels"][i],
+                self.processing_class,
+                user_span=user_span,
+                assistant_span=assistant_span,
+                num_steps=self.num_prediction_steps + 1
+            )
+
+            if boundaries is None or len(boundaries) < 2:
+                # Fallback (same as triple batch)
+                ids = inputs["input_ids"][i].tolist()
+                sep_tokens = self.processing_class.encode("\n\n", add_special_tokens=False)
+                actual_separators = 0
+                for j in range(len(ids) - len(sep_tokens) + 1):
+                    if ids[j:j+len(sep_tokens)] == sep_tokens:
+                        actual_separators += 1
+                max_possible_pairs = actual_separators if actual_separators > 0 else 1
+                num_boundaries_to_create = min(self.num_prediction_steps + 1, max_possible_pairs + 1)
+                last_token = self._last_token_index(
+                    inputs["input_ids"][i:i+1],
+                    inputs["labels"][i:i+1],
+                    inputs["attention_mask"][i:i+1]
+                )[0].item()
+                boundaries = [last_token * (j+1) // (num_boundaries_to_create + 1)
+                             for j in range(num_boundaries_to_create)]
+
+            num_pairs = len(boundaries) - 1
+            all_step_boundaries.append(boundaries)
+            num_pairs_per_sample.append(num_pairs)
+
+        # === BATCH 1: LM Loss (unchanged) ===
+        batch1_input_ids = inputs["input_ids"]
+        batch1_labels = inputs["labels"]
+
+        # === BATCH 2: Insert predictors ===
+        batch2_input_ids_list = []
+        predictor_positions_list = []
+        adjusted_target_positions_list = []  # NEW: track adjusted target positions
+
+        for i in range(batch_size):
+            boundaries = all_step_boundaries[i]
+            num_pairs = num_pairs_per_sample[i]
+            original_seq = inputs["input_ids"][i]
+
+            new_seq_parts = []
+            predictor_positions = []
+            adjusted_target_positions = []  # Target positions after inserting predictors
+            cumulative_offset = 0
+
+            prev_pos = 0
+            for step_idx in range(num_pairs):
+                step_end = boundaries[step_idx]
+
+                # Add tokens up to step_end
+                new_seq_parts.append(original_seq[prev_pos:step_end+1])
+
+                # Insert K predictor tokens
+                predictor_ids = [
+                    self.processing_class.convert_tokens_to_ids(f"<|predictor_{j+1}|>")
+                    for j in range(self.step_jepa_predictors)
+                ]
+                new_seq_parts.append(torch.tensor(predictor_ids, device=device))
+
+                # Track last predictor position
+                predictor_pos = step_end + cumulative_offset + self.step_jepa_predictors
+                predictor_positions.append(predictor_pos)
+
+                # Track target position (step t+1) adjusted for predictors inserted so far
+                if step_idx + 1 < len(boundaries):
+                    target_pos_original = boundaries[step_idx + 1]
+                    # Adjust for predictors inserted up to this point (step_idx+1 predictors)
+                    target_pos_adjusted = target_pos_original + (step_idx + 1) * self.step_jepa_predictors
+                    adjusted_target_positions.append(target_pos_adjusted)
+
+                cumulative_offset += self.step_jepa_predictors
+                prev_pos = step_end + 1
+
+            # Add remaining tokens
+            new_seq_parts.append(original_seq[prev_pos:])
+            new_seq = torch.cat(new_seq_parts)
+
+            batch2_input_ids_list.append(new_seq)
+            predictor_positions_list.append(predictor_positions)
+            adjusted_target_positions_list.append(adjusted_target_positions)
+
+        # Pad batch2 sequences
+        max_len_batch2 = max(seq.shape[0] for seq in batch2_input_ids_list)
+        batch2_input_ids = torch.full(
+            (batch_size, max_len_batch2),
+            self.processing_class.pad_token_id,
+            device=device
+        )
+        for i, seq in enumerate(batch2_input_ids_list):
+            batch2_input_ids[i, :seq.shape[0]] = seq
+
+        # Batch2 labels: all masked
+        batch2_labels = torch.full((batch_size, max_len_batch2), -100, device=device)
+
+        # === Pad both batches to same max_length ===
+        max_len = max(batch1_input_ids.shape[1], batch2_input_ids.shape[1])
+
+        def pad_to_length(tensor, target_len, pad_value):
+            if tensor.shape[1] < target_len:
+                padding = torch.full(
+                    (tensor.shape[0], target_len - tensor.shape[1]),
+                    pad_value,
+                    device=device
+                )
+                return torch.cat([tensor, padding], dim=1)
+            return tensor
+
+        batch1_input_ids = pad_to_length(batch1_input_ids, max_len, self.processing_class.pad_token_id)
+        batch1_labels = pad_to_length(batch1_labels, max_len, -100)
+        batch2_input_ids = pad_to_length(batch2_input_ids, max_len, self.processing_class.pad_token_id)
+        batch2_labels = pad_to_length(batch2_labels, max_len, -100)
+
+        # === Create attention masks (DOUBLE batch, both normal causal) ===
+        doubled_mask = torch.full((batch_size * 2, 1, max_len, max_len), float('-inf')).to(device)
+
+        for i in range(batch_size):
+            last_token = self._last_token_index(
+                inputs["input_ids"][i:i+1],
+                inputs["labels"][i:i+1],
+                inputs["attention_mask"][i:i+1]
+            )[0].item()
+
+            # BATCH 1: Normal causal
+            seq_len = last_token + 1
+            doubled_mask[i, 0, :seq_len, :seq_len] = self._build_additive_mask(seq_len)
+
+            # BATCH 2: Normal causal (with predictors)
+            seq_len_with_pred = seq_len + num_pairs_per_sample[i] * self.step_jepa_predictors
+            doubled_mask[i + batch_size, 0, :seq_len_with_pred, :seq_len_with_pred] = \
+                self._build_additive_mask(seq_len_with_pred)
+
+        # Store metadata
+        self._all_step_boundaries = all_step_boundaries
+        self._predictor_positions = predictor_positions_list
+        self._adjusted_target_positions = adjusted_target_positions_list  # NEW
+        self._num_pairs_per_sample = num_pairs_per_sample
+
+        # Double batch (not triple)
+        doubled_input_ids = torch.cat([batch1_input_ids, batch2_input_ids], dim=0)
+        doubled_labels = torch.cat([batch1_labels, batch2_labels], dim=0)
+
+        return {
+            "input_ids": doubled_input_ids,      # Shape: (batch_size * 2, seq_len)
+            "labels": doubled_labels,            # Shape: (batch_size * 2, seq_len)
+            "attention_mask": doubled_mask,      # Shape: (batch_size * 2, 1, seq_len, seq_len)
+        }, False
+
     def build_with_additive_mask(self, inputs):
         """
         Dispatcher for Step-JEPA batch construction.
 
-        Routes to appropriate batch construction method based on num_prediction_steps:
-        - num_prediction_steps == 1: Double batch (current behavior, backward compatible)
-        - num_prediction_steps > 1: Triple batch (multi-step JEPA)
+        Routes to appropriate batch construction method based on num_prediction_steps
+        and use_localized_masks config.
         """
         # Apply jepa_ratio dropout
         if self.jepa_ratio > 0.0:
@@ -607,19 +947,29 @@ class JepaTrainer(Trainer):
                     "input_ids": inputs["input_ids"],
                     "labels": inputs["labels"],
                     "attention_mask": inputs["attention_mask"],
-                }, True  # skip_jepa=True, means no jepa loss and compute sft loss only
+                }, True  # skip_jepa=True
 
-        # Extract metadata if available
+        # Extract metadata
         user_spans = inputs.get("user_span", None)
         assistant_spans = inputs.get("assistant_span", None)
 
-        # Route to appropriate batch construction method
+        # Route based on config
         if self.num_prediction_steps == 1:
-            # Use existing double-batch logic (backward compatible)
-            return self._build_double_batch(inputs, user_spans, assistant_spans)
+            # Single-step: check if isolation masks enabled
+            if self.use_localized_masks:
+                # Original behavior (with view2 isolation)
+                return self._build_double_batch(inputs, user_spans, assistant_spans)
+            else:
+                # New mode (no view2 isolation)
+                return self._build_double_batch_no_isolation(inputs, user_spans, assistant_spans)
         else:
-            # Use new triple-batch logic for multi-step JEPA
-            return self._build_triple_batch(inputs, user_spans, assistant_spans)
+            # Multi-step: check if localized masks enabled
+            if self.use_localized_masks:
+                # Triple batch with localized step masks (current behavior)
+                return self._build_triple_batch(inputs, user_spans, assistant_spans)
+            else:
+                # Double batch with normal causal masks (new mode)
+                return self._build_double_batch_multistep(inputs, user_spans, assistant_spans)
 
     def forward(self, model, inputs):
         """
@@ -665,14 +1015,23 @@ class JepaTrainer(Trainer):
         if skip_jepa:
             jepa_hidden_states = None
         else:
-            # Detect batch structure based on num_prediction_steps
-            if self.num_prediction_steps == 1:
-                # Double batch: extract second half for JEPA
-                batch_size = llm_inputs["input_ids"].shape[0] // 2
-                jepa_hidden_states = outputs.hidden_states[-1][batch_size: batch_size * 2] # shape: (batch_size, seq_len (include predictors), hidden_size)
-            else:
-                # Triple batch: keep all hidden states, will extract in compute_loss
+            # Detect batch structure
+            total_batch_size = llm_inputs["input_ids"].shape[0]
+            original_batch_size = inputs["input_ids"].shape[0]
+
+            if total_batch_size == original_batch_size * 2:
+                # DOUBLE BATCH (either num_prediction_steps=1 OR use_localized_masks=False)
+                if self.num_prediction_steps == 1:
+                    # Single-step: extract second half only
+                    jepa_hidden_states = outputs.hidden_states[-1][original_batch_size:original_batch_size*2]
+                else:
+                    # Multi-step without localized masks: keep second half for both predictor and target
+                    jepa_hidden_states = outputs.hidden_states[-1][original_batch_size:original_batch_size*2]
+            elif total_batch_size == original_batch_size * 3:
+                # TRIPLE BATCH (use_localized_masks=True)
                 jepa_hidden_states = outputs.hidden_states[-1]
+            else:
+                raise ValueError(f"Unexpected batch structure: total={total_batch_size}, original={original_batch_size}")
 
         if self.debug == 2 and torch.cuda.current_device() == 0:
             if jepa_hidden_states is not None:
@@ -742,54 +1101,91 @@ class JepaTrainer(Trainer):
             else:
                 jepa_loss = 1.0 - torch.mean(cosine_similarity)
         else:
-            # ===== TRIPLE BATCH: Multi-step prediction =====
+            # ===== MULTI-STEP PREDICTION =====
+            # Detect if we're using triple batch (localized) or double batch (non-localized)
             total_batch_size = jepa_hidden_states.shape[0]
-            batch_size = total_batch_size // 3
+            original_batch_size = len(self._num_pairs_per_sample)
 
-            # Extract hidden states from 3 batches
-            batch2_hidden = jepa_hidden_states[batch_size:2*batch_size]  # Predictors
-            batch3_hidden = jepa_hidden_states[2*batch_size:]  # Targets
+            if total_batch_size == original_batch_size * 3:
+                # TRIPLE BATCH: localized masks enabled
+                batch_size = original_batch_size
+                batch2_hidden = jepa_hidden_states[batch_size:2*batch_size]  # Predictors
+                batch3_hidden = jepa_hidden_states[2*batch_size:]             # Targets (localized)
 
-            # Compute loss for all prediction pairs
-            total_loss = 0.0
-            total_pairs = 0
-            all_similarities = []
+                # Extract from separate batches (existing logic)
+                total_loss = 0.0
+                total_pairs = 0
+                all_similarities = []
 
-            for i in range(batch_size):
-                num_pairs = self._num_pairs_per_sample[i]
-                boundaries = self._all_step_boundaries[i]
-                predictor_positions = self._predictor_positions[i]
+                for i in range(batch_size):
+                    num_pairs = self._num_pairs_per_sample[i]
+                    boundaries = self._all_step_boundaries[i]
+                    predictor_positions = self._predictor_positions[i]
 
-                for pair_idx in range(num_pairs):
-                    # Predictor embedding (from batch 2)
-                    pred_pos = predictor_positions[pair_idx]
-                    pred_emb = batch2_hidden[i, pred_pos, :]
+                    for pair_idx in range(num_pairs):
+                        pred_pos = predictor_positions[pair_idx]
+                        pred_emb = batch2_hidden[i, pred_pos, :]
 
-                    # Target embedding (from batch 3)
-                    target_pos = boundaries[pair_idx + 1]  # step t+1
-                    target_emb = batch3_hidden[i, target_pos, :]
+                        target_pos = boundaries[pair_idx + 1]  # Original position
+                        target_emb = batch3_hidden[i, target_pos, :]
 
-                    # Compute similarity
-                    sim = F.cosine_similarity(pred_emb.unsqueeze(0), target_emb.unsqueeze(0), dim=-1)
-                    all_similarities.append(sim)
+                        sim = F.cosine_similarity(pred_emb.unsqueeze(0), target_emb.unsqueeze(0), dim=-1)
+                        all_similarities.append(sim)
 
-                    # Accumulate loss based on loss type
-                    if self.jepa_l2:
-                        total_loss += torch.linalg.norm(pred_emb - target_emb, ord=2)
-                    elif self.jepa_mse:
-                        total_loss += torch.mean((pred_emb - target_emb) ** 2)
-                    elif self.infonce:
-                        # InfoNCE for multi-step not fully supported yet, use cosine for now
-                        total_loss += (1.0 - sim)
-                    else:
-                        total_loss += (1.0 - sim)
+                        if self.jepa_l2:
+                            total_loss += torch.linalg.norm(pred_emb - target_emb, ord=2)
+                        elif self.jepa_mse:
+                            total_loss += torch.mean((pred_emb - target_emb) ** 2)
+                        elif self.infonce:
+                            total_loss += (1.0 - sim)
+                        else:
+                            total_loss += (1.0 - sim)
 
-                    total_pairs += 1
+                        total_pairs += 1
 
-            # Average loss across all pairs
-            jepa_loss = total_loss / total_pairs if total_pairs > 0 else 0.0
+                jepa_loss = total_loss / total_pairs if total_pairs > 0 else 0.0
 
-            # Stack similarities for debugging
+            elif total_batch_size == original_batch_size:
+                # DOUBLE BATCH: localized masks disabled (use_localized_masks=False)
+                batch_size = original_batch_size
+                batch2_hidden = jepa_hidden_states  # Both predictor and target from same batch
+
+                # Extract from SAME batch using adjusted positions
+                total_loss = 0.0
+                total_pairs = 0
+                all_similarities = []
+
+                for i in range(batch_size):
+                    num_pairs = self._num_pairs_per_sample[i]
+                    predictor_positions = self._predictor_positions[i]
+                    adjusted_target_positions = self._adjusted_target_positions[i]  # NEW
+
+                    for pair_idx in range(num_pairs):
+                        pred_pos = predictor_positions[pair_idx]
+                        pred_emb = batch2_hidden[i, pred_pos, :]
+
+                        target_pos = adjusted_target_positions[pair_idx]  # Adjusted position
+                        target_emb = batch2_hidden[i, target_pos, :]
+
+                        sim = F.cosine_similarity(pred_emb.unsqueeze(0), target_emb.unsqueeze(0), dim=-1)
+                        all_similarities.append(sim)
+
+                        if self.jepa_l2:
+                            total_loss += torch.linalg.norm(pred_emb - target_emb, ord=2)
+                        elif self.jepa_mse:
+                            total_loss += torch.mean((pred_emb - target_emb) ** 2)
+                        elif self.infonce:
+                            total_loss += (1.0 - sim)
+                        else:
+                            total_loss += (1.0 - sim)
+
+                        total_pairs += 1
+
+                jepa_loss = total_loss / total_pairs if total_pairs > 0 else 0.0
+            else:
+                raise ValueError(f"Unexpected batch structure in multi-step: total={total_batch_size}, original={original_batch_size}")
+
+            # Stack similarities
             if len(all_similarities) > 0:
                 cosine_similarity = torch.cat(all_similarities)
             else:

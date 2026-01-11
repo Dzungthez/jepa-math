@@ -52,6 +52,12 @@ def main():
                        help="Number of consecutive step pairs to predict (default=1). "
                             "Use 1 for current behavior, >1 for multi-step JEPA. "
                             "Incompatible with --view_based_jepa.")
+    parser.add_argument("--use_localized_masks", type = bool, default=True,
+                       help="Use localized step masks for multi-step JEPA (default: True). "
+                            "When disabled, uses normal causal masks (saves memory: 2x vs 3x).")
+    parser.add_argument("--no_localized_masks", action="store_false", dest="use_localized_masks",
+                       help="Disable localized step masks (use normal causal instead).")
+    parser.set_defaults(use_localized_masks=True)
 
     # Other
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -90,6 +96,8 @@ def main():
         print(f"Unmask user content: {args.unmask_user}")
         print(f"JEPA mode: {'View-based' if args.view_based_jepa else 'Step-based'}")
         print(f"Number of prediction steps: {args.num_prediction_steps}")
+        if args.num_prediction_steps > 1:
+            print(f"Use localized masks: {args.use_localized_masks}")
         print(f"Predictors (K): {args.predictors}")
         print(f"Last token: {args.last_token}")
         if args.step_jepa:
@@ -273,6 +281,7 @@ def main():
             unmask_user=args.unmask_user,
             view_based_jepa=args.view_based_jepa,
             num_prediction_steps=args.num_prediction_steps,
+            use_localized_masks=args.use_localized_masks,
         )
 
         trainable_params = []
