@@ -32,8 +32,66 @@ class JepaTrainer(Trainer):
                 "Cannot use both --view_based_jepa and --num_prediction_steps > 1. "
                 "Multi-step JEPA requires step boundaries from '\\n\\n' separators."
             )
+        # Debugging
+        self.print_nn_positions = kwargs.pop("print_nn_positions", False)
+        self.print_nn_max_steps = kwargs.pop("print_nn_max_steps", 5)   # chỉ in 5 bước đầu
+        self.print_nn_max_per_sample = kwargs.pop("print_nn_max_per_sample", 10)
+        self._printed_nn_steps = 0
+
+        self.print_last_step_target_debug = kwargs.pop("print_last_step_target_debug", False)
+        self.print_last_step_target_max = kwargs.pop("print_last_step_target_max", 10)
+        self._print_last_step_target_count = 0
+
 
         super().__init__(*args, **kwargs)
+
+    def _debug_print_nn(self, tokenizer, input_ids_1d, assistant_start, assistant_end, sample_idx=0):
+        """
+        In ra các vị trí token nằm trong nn_token_ids, và decode cửa sổ quanh nó để verify.
+        """
+        if not self.print_nn_positions:
+            return
+
+        # chỉ in ở gpu0 và giới hạn số step
+        if torch.cuda.is_available():
+            if torch.cuda.current_device() != 0:
+                return
+        if self._printed_nn_steps >= self.print_nn_max_steps:
+            return
+
+        ids = input_ids_1d.tolist()
+        hits = []
+        for pos in range(assistant_start, assistant_end + 1):
+            if ids[pos] in self.nn_token_ids:
+                hits.append(pos)
+                if len(hits) >= self.print_nn_max_per_sample:
+                    break
+
+        print(f"\n[NN-DEBUG] sample={sample_idx} assistant_span=[{assistant_start},{assistant_end}] "
+            f"hits={len(hits)} positions={hits}")
+
+        # decode từng hit với context window
+        window = 8  # số token trước/sau để nhìn
+        for pos in hits:
+            lo = max(assistant_start, pos - window)
+            hi = min(assistant_end, pos + window)
+            chunk_ids = ids[lo:hi+1]
+
+            # decode cửa sổ
+            chunk_txt = tokenizer.decode(chunk_ids, skip_special_tokens=False)
+            tok_txt = tokenizer.decode([ids[pos]], skip_special_tokens=False)
+
+            # show rõ vị trí token trong cửa sổ bằng cách decode prefix/suffix
+            prefix = tokenizer.decode(ids[lo:pos], skip_special_tokens=False)
+            suffix = tokenizer.decode(ids[pos+1:hi+1], skip_special_tokens=False)
+
+            print(f"  - pos={pos} token_id={ids[pos]}")
+            print(f"    token_decoded: {repr(tok_txt)}")
+            print(f"    window[{lo}:{hi}]: {repr(chunk_txt)}")
+            print(f"    split: {repr(prefix)} || {repr(tok_txt)} || {repr(suffix)}")
+
+        self._printed_nn_steps += 1
+
 
     def _load_nn_tokens(self, path):
         """Load pre-collected token IDs that contain '\n\n'"""
@@ -43,7 +101,7 @@ class JepaTrainer(Trainer):
         if not os.path.exists(path):
             print(f"WARNING: nn_tokens.json not found at {path}, using fallback")
             # Fallback: common tokens for Llama-3.2
-            return {271, 382, 627}  # Common "\n\n" tokens
+            return [1473, 2595, 45464, 35432, 2266, 43115, 95181, 271, 57277, 7887, 9456, 1363, 2195, 696, 15804, 1980, 3677, 382]
 
         with open(path, 'r') as f:
             data = json.load(f)
@@ -87,13 +145,6 @@ class JepaTrainer(Trainer):
         Uses metadata if available, falls back to label-based detection.
 
         CRITICAL: Always searches for "\\n\\n" ONLY within assistant span.
-
-        Args:
-            num_steps: Number of step boundaries to find (default=2 for backward compat)
-
-        Returns:
-            List of boundary positions, or None if fewer than 2 found
-            Returns all available boundaries if fewer than num_steps exist
         """
         ids = input_ids.tolist()
         lab = labels.tolist()
@@ -140,7 +191,7 @@ class JepaTrainer(Trainer):
                 return None
 
         # Search for "\\n\\n" ONLY within assistant span
-        # Use precomputed token set (more reliable than token sequence comparison)
+        # Use precomputed token set 
         occ = []
 
         for i in range(assistant_start, assistant_end):
@@ -151,6 +202,11 @@ class JepaTrainer(Trainer):
                 # Only need num_steps - 1 separators
                 if len(occ) >= num_steps - 1:
                     break
+        if self.print_last_step_target_debug and (not torch.cuda.is_available() or torch.cuda.current_device() == 0):
+            if self._print_last_step_target_count < self.print_last_step_target_max:
+                self._print_last_step_target_count += 1
+                print("[LAST_STEP_TARGET_DEBUG] occ(separators found) =", occ, 
+                            " (assistant_end candidate =", assistant_end, ")")
 
         # Add assistant_end as final boundary (if enabled)
         if self.include_last_step_target:
@@ -161,6 +217,11 @@ class JepaTrainer(Trainer):
                 # Special case: single step with no separators
                 occ = [assistant_end]
 
+        if self.print_last_step_target_debug and (not torch.cuda.is_available() or torch.cuda.current_device() == 0):
+            if self._print_last_step_target_count < self.print_last_step_target_max:
+                print("[LAST_STEP_TARGET_DEBUG] occ(after maybe append assistant_end) =", occ)
+
+
         # Apply last_token offset to ALL boundaries
         adjusted_occ = []
         for boundary in occ:
@@ -168,6 +229,19 @@ class JepaTrainer(Trainer):
             # Clamp to valid range [0, assistant_end]
             adjusted_boundary = max(0, min(adjusted_boundary, assistant_end))
             adjusted_occ.append(adjusted_boundary)
+
+        if self.print_last_step_target_debug and (not torch.cuda.is_available() or torch.cuda.current_device() == 0):
+            if self._print_last_step_target_count < self.print_last_step_target_max:
+                print("[LAST_STEP_TARGET_DEBUG] adjusted_occ =", adjusted_occ)
+                if len(occ) > 0:
+                    print("[LAST_STEP_TARGET_DEBUG] last_raw_boundary =", occ[-1], 
+                        " last_adjusted_boundary =", adjusted_occ[-1])
+                self._print_last_step_target_count += 1
+
+
+        # Debug print positions of tokens that contain "\n\n"
+        if self.print_nn_positions:
+            self._debug_print_nn(tokenizer, input_ids, assistant_start, assistant_end, sample_idx=-1)
 
         # Need at least num_steps boundaries to form prediction pairs
         if len(adjusted_occ) < num_steps:
@@ -843,7 +917,7 @@ class JepaTrainer(Trainer):
             if assistant_spans is not None:
                 assistant_span = (assistant_spans[i][0].item(), assistant_spans[i][1].item())
 
-            # Find boundaries (reuse existing logic)
+            # Find boundaries
             boundaries = self._find_step_boundaries(
                 inputs["input_ids"][i],
                 inputs["labels"][i],

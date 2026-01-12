@@ -67,7 +67,7 @@ def main():
                        help="Path to JSON file containing token IDs for '\\n\\n'")
 
     # Other
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument("--debug", type=int, default=5, help="Debug level")
     parser.add_argument("--pretrain", action="store_true", help="Pretraining mode")
     parser.add_argument("--same_flop", action="store_true", help="Adjust epochs/steps to match FLOPs")
