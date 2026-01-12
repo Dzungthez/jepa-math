@@ -18,6 +18,7 @@ class JepaTrainer(Trainer):
         self.view_based_jepa = kwargs.pop('view_based_jepa', False)
         self.num_prediction_steps = kwargs.pop('num_prediction_steps', 1)
         self.use_localized_masks = kwargs.pop('use_localized_masks', True)
+        self.include_last_step_target = kwargs.pop('include_last_step_target', True)
 
         assert self.jepa_l2 + self.jepa_mse <= 1, "Only one of jepa_l2 and jepa_mse can be True."
 
@@ -123,15 +124,32 @@ class JepaTrainer(Trainer):
         for i in range(assistant_start, assistant_end - len(sep_tokens) + 2):
             if ids[i:i+len(sep_tokens)] == sep_tokens:
                 occ.append(i + len(sep_tokens) - 1)
-                # Keep searching until we have num_steps OR reach end
-                if len(occ) >= num_steps:
+                # Keep searching until we have num_steps - 1 separators (last boundary will be assistant_end)
+                if len(occ) >= num_steps - 1:
                     break
 
-        # Need at least 2 boundaries to form 1 prediction pair
-        if len(occ) < 2:
+        # Add assistant_end as final boundary (if enabled)
+        if self.include_last_step_target:
+            if len(occ) > 0:
+                # Have separators, add assistant_end as final boundary
+                occ.append(assistant_end)
+            elif num_steps == 1:
+                # Special case: single step with no separators
+                occ = [assistant_end]
+
+        # Apply last_token offset to ALL boundaries
+        adjusted_occ = []
+        for boundary in occ:
+            adjusted_boundary = boundary + self.last_token
+            # Clamp to valid range [0, assistant_end]
+            adjusted_boundary = max(0, min(adjusted_boundary, assistant_end))
+            adjusted_occ.append(adjusted_boundary)
+
+        # Need at least num_steps boundaries to form prediction pairs
+        if len(adjusted_occ) < num_steps:
             return None
 
-        return occ  # Return list (not tuple)
+        return adjusted_occ  # Return adjusted list
 
     def _find_view_boundaries(self, input_ids, labels, user_span=None, assistant_span=None):
         """
@@ -214,14 +232,21 @@ class JepaTrainer(Trainer):
                     view1_end = boundaries[0]
                     view2_end = boundaries[1]
                 else:
-                    # Fallback to sequence thirds
+                    # Fallback to sequence division
                     last_token = self._last_token_index(
                         inputs["input_ids"][i:i+1],
                         inputs["labels"][i:i+1],
                         inputs["attention_mask"][i:i+1]
                     )[0].item()
-                    view1_end = last_token // 3
-                    view2_end = (last_token * 2) // 3
+
+                    if self.include_last_step_target:
+                        # New behavior: include last_token position as final boundary
+                        view1_end = last_token // 2
+                        view2_end = last_token
+                    else:
+                        # Old behavior: omit final boundary
+                        view1_end = last_token // 3
+                        view2_end = (last_token * 2) // 3
 
             view1_end_positions.append(view1_end)
             view2_end_positions.append(view2_end)
@@ -394,14 +419,21 @@ class JepaTrainer(Trainer):
                     view1_end = boundaries[0]
                     view2_end = boundaries[1]
                 else:
-                    # Fallback to sequence thirds
+                    # Fallback to sequence division
                     last_token = self._last_token_index(
                         inputs["input_ids"][i:i+1],
                         inputs["labels"][i:i+1],
                         inputs["attention_mask"][i:i+1]
                     )[0].item()
-                    view1_end = last_token // 3
-                    view2_end = (last_token * 2) // 3
+
+                    if self.include_last_step_target:
+                        # New behavior: include last_token position as final boundary
+                        view1_end = last_token // 2
+                        view2_end = last_token
+                    else:
+                        # Old behavior: omit final boundary
+                        view1_end = last_token // 3
+                        view2_end = (last_token * 2) // 3
 
             view1_end_pos.append(view1_end)
             view2_end_pos.append(view2_end)
@@ -617,8 +649,15 @@ class JepaTrainer(Trainer):
                 )[0].item()
 
                 # Divide sequence into num_boundaries_to_create parts
-                boundaries = [last_token * (j+1) // (num_boundaries_to_create + 1)
-                             for j in range(num_boundaries_to_create)]
+                if self.include_last_step_target:
+                    # New behavior: include last_token position as final boundary
+                    boundaries = [last_token * (j+1) // (num_boundaries_to_create + 1)
+                                 for j in range(num_boundaries_to_create - 1)]
+                    boundaries.append(last_token)  # Add exact last_token position
+                else:
+                    # Old behavior: omit final boundary
+                    boundaries = [last_token * (j+1) // (num_boundaries_to_create + 1)
+                                 for j in range(num_boundaries_to_create)]
 
             # Actual number of pairs = len(boundaries) - 1
             num_pairs = len(boundaries) - 1
@@ -805,8 +844,16 @@ class JepaTrainer(Trainer):
                     inputs["labels"][i:i+1],
                     inputs["attention_mask"][i:i+1]
                 )[0].item()
-                boundaries = [last_token * (j+1) // (num_boundaries_to_create + 1)
-                             for j in range(num_boundaries_to_create)]
+
+                if self.include_last_step_target:
+                    # New behavior: include last_token position as final boundary
+                    boundaries = [last_token * (j+1) // (num_boundaries_to_create + 1)
+                                 for j in range(num_boundaries_to_create - 1)]
+                    boundaries.append(last_token)  # Add exact last_token position
+                else:
+                    # Old behavior: omit final boundary
+                    boundaries = [last_token * (j+1) // (num_boundaries_to_create + 1)
+                                 for j in range(num_boundaries_to_create)]
 
             num_pairs = len(boundaries) - 1
             all_step_boundaries.append(boundaries)

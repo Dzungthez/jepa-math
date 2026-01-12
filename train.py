@@ -58,6 +58,11 @@ def main():
     parser.add_argument("--no_localized_masks", action="store_false", dest="use_localized_masks",
                        help="Disable localized step masks (use normal causal instead).")
     parser.set_defaults(use_localized_masks=True)
+    parser.add_argument("--include_last_step_target", action="store_true", default=True,
+                       help="Include assistant_end as target for last step (default: True). "
+                            "When False, last step has no target (backward compatibility).")
+    parser.add_argument("--omit_last_step_target", action="store_false", dest="include_last_step_target",
+                       help="Omit last step target (old behavior).")
 
     # Other
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -98,8 +103,9 @@ def main():
         print(f"Number of prediction steps: {args.num_prediction_steps}")
         if args.num_prediction_steps > 1:
             print(f"Use localized masks: {args.use_localized_masks}")
+        print(f"Include last step target: {args.include_last_step_target}")
+        print(f"Last token offset: {args.last_token}")
         print(f"Predictors (K): {args.predictors}")
-        print(f"Last token: {args.last_token}")
         if args.step_jepa:
             print(f"Step-JEPA: Isolate Step 2, K={args.predictors} tokens after Step 1")
 
@@ -282,6 +288,7 @@ def main():
             view_based_jepa=args.view_based_jepa,
             num_prediction_steps=args.num_prediction_steps,
             use_localized_masks=args.use_localized_masks,
+            include_last_step_target=args.include_last_step_target,
         )
 
         trainable_params = []
