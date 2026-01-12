@@ -58,11 +58,13 @@ def main():
     parser.add_argument("--no_localized_masks", action="store_false", dest="use_localized_masks",
                        help="Disable localized step masks (use normal causal instead).")
     parser.set_defaults(use_localized_masks=True)
-    parser.add_argument("--include_last_step_target", action="store_true", default=True,
+    parser.add_argument("--include_last_step_target", type=bool, default=True,
                        help="Include assistant_end as target for last step (default: True). "
                             "When False, last step has no target (backward compatibility).")
-    parser.add_argument("--omit_last_step_target", action="store_false", dest="include_last_step_target",
+    parser.add_argument("--omit_last_step_target", type=bool, default=False, dest="include_last_step_target",
                        help="Omit last step target (old behavior).")
+    parser.add_argument("--nn_tokens_path", type=str, default="nn_tokens.json",
+                       help="Path to JSON file containing token IDs for '\\n\\n'")
 
     # Other
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -289,6 +291,7 @@ def main():
             num_prediction_steps=args.num_prediction_steps,
             use_localized_masks=args.use_localized_masks,
             include_last_step_target=args.include_last_step_target,
+            nn_tokens_path=args.nn_tokens_path,
         )
 
         trainable_params = []

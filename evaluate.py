@@ -8,7 +8,7 @@ from transformers import AutoTokenizer
 
 
 # Configuration parameters
-DEFAULT_MODEL_PATH = "./checkpoints_sft/checkpoint-1287"
+DEFAULT_MODEL_PATH = "./checkpoints_step_jepa_adapted/checkpoint-243"
 DEFAULT_TEST_FILE = "datasets/gsm8k_test.jsonl"
 DEFAULT_OUTPUT_FILE = "./evaluation_results.jsonl"
 DEFAULT_MAX_NEW_TOKENS = 2048

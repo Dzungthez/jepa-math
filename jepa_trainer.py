@@ -20,6 +20,10 @@ class JepaTrainer(Trainer):
         self.use_localized_masks = kwargs.pop('use_localized_masks', True)
         self.include_last_step_target = kwargs.pop('include_last_step_target', True)
 
+        # Load "\n\n" token IDs (collected offline)
+        nn_tokens_path = kwargs.pop('nn_tokens_path', 'nn_tokens.json')
+        self.nn_token_ids = self._load_nn_tokens(nn_tokens_path)
+
         assert self.jepa_l2 + self.jepa_mse <= 1, "Only one of jepa_l2 and jepa_mse can be True."
 
         # Validation: view_based_jepa incompatible with multi-step
@@ -30,8 +34,26 @@ class JepaTrainer(Trainer):
             )
 
         super().__init__(*args, **kwargs)
-    
-        
+
+    def _load_nn_tokens(self, path):
+        """Load pre-collected token IDs that contain '\n\n'"""
+        import json
+        import os
+
+        if not os.path.exists(path):
+            print(f"WARNING: nn_tokens.json not found at {path}, using fallback")
+            # Fallback: common tokens for Llama-3.2
+            return {271, 382, 627}  # Common "\n\n" tokens
+
+        with open(path, 'r') as f:
+            data = json.load(f)
+
+        nn_token_ids = set(data['nn_token_ids'])
+        print(f"Loaded {len(nn_token_ids)} '\n\n' token IDs from {path}")
+        print(f"Token IDs: {sorted(nn_token_ids)}")
+
+        return nn_token_ids
+
     def _build_additive_mask(self, k: int):
         mask = torch.zeros((k, k), dtype=torch.float32)
         mask[torch.triu(torch.ones(k, k), diagonal=1) == 1] = -torch.inf
@@ -118,13 +140,15 @@ class JepaTrainer(Trainer):
                 return None
 
         # Search for "\\n\\n" ONLY within assistant span
-        sep_tokens = tokenizer.encode("\n\n", add_special_tokens=False)
+        # Use precomputed token set (more reliable than token sequence comparison)
         occ = []
 
-        for i in range(assistant_start, assistant_end - len(sep_tokens) + 2):
-            if ids[i:i+len(sep_tokens)] == sep_tokens:
-                occ.append(i + len(sep_tokens) - 1)
-                # Keep searching until we have num_steps - 1 separators (last boundary will be assistant_end)
+        for i in range(assistant_start, assistant_end):
+            # Simple set membership check (very fast!)
+            if ids[i] in self.nn_token_ids:
+                occ.append(i)  # Found a token containing "\n\n"
+
+                # Only need num_steps - 1 separators
                 if len(occ) >= num_steps - 1:
                     break
 
