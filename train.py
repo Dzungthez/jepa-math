@@ -66,6 +66,14 @@ def main():
     parser.add_argument("--nn_tokens_path", type=str, default="nn_tokens.json",
                        help="Path to JSON file containing token IDs for '\\n\\n'")
 
+    # Entropy-based JEPA filtering
+    parser.add_argument("--entropy_filter", action="store_true",
+                       help="Enable entropy-based filtering for JEPA loss")
+    parser.add_argument("--entropy_top_k", type=int, default=2,
+                       help="Number of top-k high-entropy steps to use for JEPA (default: 2)")
+    parser.add_argument("--entropy_context_window", type=int, default=2,
+                       help="Context window size (tokens on each side) for entropy (default: 2)")
+
     # Other
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument("--debug", type=int, default=5, help="Debug level")
@@ -292,6 +300,9 @@ def main():
             use_localized_masks=args.use_localized_masks,
             include_last_step_target=args.include_last_step_target,
             nn_tokens_path=args.nn_tokens_path,
+            entropy_filter=args.entropy_filter,
+            entropy_top_k=args.entropy_top_k,
+            entropy_context_window=args.entropy_context_window,
         )
 
         trainable_params = []

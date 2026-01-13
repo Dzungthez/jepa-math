@@ -24,6 +24,11 @@ class JepaTrainer(Trainer):
         nn_tokens_path = kwargs.pop('nn_tokens_path', 'nn_tokens.json')
         self.nn_token_ids = self._load_nn_tokens(nn_tokens_path)
 
+        # Entropy-based filtering
+        self.entropy_filter = kwargs.pop('entropy_filter', False)
+        self.entropy_top_k = kwargs.pop('entropy_top_k', 2)
+        self.entropy_context_window = kwargs.pop('entropy_context_window', 2)
+
         assert self.jepa_l2 + self.jepa_mse <= 1, "Only one of jepa_l2 and jepa_mse can be True."
 
         # Validation: view_based_jepa incompatible with multi-step
@@ -111,6 +116,94 @@ class JepaTrainer(Trainer):
         print(f"Token IDs: {sorted(nn_token_ids)}")
 
         return nn_token_ids
+
+    def _compute_token_entropy(self, logits: torch.Tensor) -> torch.Tensor:
+        """
+        Compute entropy for each token position.
+
+        Args:
+            logits: (batch_size, seq_len, vocab_size)
+
+        Returns:
+            entropy: (batch_size, seq_len) - entropy per token
+        """
+        # Formula from notebook: H = log(Z) - sum(p * logits)
+        logZ = torch.logsumexp(logits, dim=-1)  # (B, T)
+        probs = torch.softmax(logits, dim=-1)   # (B, T, V)
+        entropy = logZ - (probs * logits).sum(dim=-1)  # (B, T)
+        return entropy
+
+    def _get_step_max_entropy(
+        self,
+        token_entropy: torch.Tensor,  # (seq_len,) - entropy for one sample
+        boundary_position: int,        # Position of boundary token
+        context_window_size: int = 2   # 2 tokens on each side
+    ) -> float:
+        """
+        Get max entropy in context window around step boundary.
+
+        Args:
+            token_entropy: (seq_len,) entropy values
+            boundary_position: index of boundary token (e.g., "\n\n" token)
+            context_window_size: number of tokens on each side (default: 2)
+
+        Returns:
+            max_entropy: maximum entropy value in window
+        """
+        seq_len = token_entropy.shape[0]
+
+        # Define window: [boundary - context_size, boundary + context_size]
+        window_start = max(0, boundary_position - context_window_size)
+        window_end = min(seq_len, boundary_position + context_window_size + 1)
+
+        # Extract window entropy
+        window_entropy = token_entropy[window_start:window_end]
+
+        # Return max entropy in window
+        max_entropy = window_entropy.max().item()
+
+        return max_entropy
+
+    def _select_high_entropy_steps(
+        self,
+        token_entropy: torch.Tensor,     # (seq_len,) for one sample
+        boundaries: list,                 # List of boundary positions
+        top_k: int,                       # Number of top-k steps to select
+        context_window_size: int = 2
+    ) -> list:
+        """
+        Select top-k step indices based on max entropy in context windows.
+
+        Args:
+            token_entropy: (seq_len,) entropy for one sample
+            boundaries: List of boundary positions (from _find_step_boundaries)
+            top_k: Number of high-entropy steps to select
+            context_window_size: Window size for entropy extraction
+
+        Returns:
+            selected_step_indices: List of step indices (0-indexed) to use for JEPA
+                                  e.g., [0, 3] means use step0→1 and step3→4 pairs
+        """
+        # Compute max entropy for each step boundary
+        step_entropies = []
+        for boundary_pos in boundaries[:-1]:  # Exclude last boundary (assistant_end)
+            max_entropy = self._get_step_max_entropy(
+                token_entropy,
+                boundary_pos,
+                context_window_size
+            )
+            step_entropies.append(max_entropy)
+
+        # Rank steps by entropy (descending)
+        step_indices = list(range(len(step_entropies)))
+        sorted_indices = sorted(step_indices, key=lambda i: step_entropies[i], reverse=True)
+
+        # Select top-k (capped at actual number of steps)
+        actual_k = min(top_k, len(step_entropies))
+        selected_indices = sorted_indices[:actual_k]
+        selected_indices.sort()  # Re-sort to maintain order
+
+        return selected_indices
 
     def _build_additive_mask(self, k: int):
         mask = torch.zeros((k, k), dtype=torch.float32)
@@ -1200,6 +1293,12 @@ class JepaTrainer(Trainer):
         main_outputs = forward_results['main_outputs']
         lm_loss = main_outputs.loss
 
+        # Compute token entropy if entropy filtering is enabled
+        token_entropy = None
+        if self.entropy_filter and hasattr(main_outputs, 'logits'):
+            logits = main_outputs.logits  # (batch_size, seq_len, vocab_size)
+            token_entropy = self._compute_token_entropy(logits)  # (batch_size, seq_len)
+
         # Compute representation similarity loss
         jepa_hidden_states = forward_results['jepa_hidden_states']
 
@@ -1267,7 +1366,39 @@ class JepaTrainer(Trainer):
                     boundaries = self._all_step_boundaries[i]
                     predictor_positions = self._predictor_positions[i]
 
+                    # Select high-entropy steps if entropy filtering is enabled
+                    if self.entropy_filter and token_entropy is not None:
+                        selected_steps = self._select_high_entropy_steps(
+                            token_entropy=token_entropy[i],
+                            boundaries=boundaries,
+                            top_k=self.entropy_top_k,
+                            context_window_size=self.entropy_context_window
+                        )
+
+                        # Debug output
+                        if self.debug >= 5 and torch.cuda.current_device() == 0:
+                            print(f"\n[ENTROPY FILTER] Sample {i} (triple batch):")
+                            print(f"  Total steps: {num_pairs}")
+                            print(f"  Selected high-entropy steps: {selected_steps}")
+
+                            # Show entropy values for each step
+                            for step_idx in range(num_pairs):
+                                boundary_pos = boundaries[step_idx]
+                                max_entropy = self._get_step_max_entropy(
+                                    token_entropy[i],
+                                    boundary_pos,
+                                    self.entropy_context_window
+                                )
+                                marker = "✓" if step_idx in selected_steps else "✗"
+                                print(f"  Step {step_idx}: boundary={boundary_pos}, max_entropy={max_entropy:.4f} {marker}")
+                    else:
+                        # Use all steps (no filtering)
+                        selected_steps = list(range(num_pairs))
+
                     for pair_idx in range(num_pairs):
+                        # Filter: only compute JEPA loss for selected high-entropy steps
+                        if pair_idx not in selected_steps:
+                            continue
                         pred_pos = predictor_positions[pair_idx]
                         pred_emb = batch2_hidden[i, pred_pos, :]
 
@@ -1305,7 +1436,41 @@ class JepaTrainer(Trainer):
                     predictor_positions = self._predictor_positions[i]
                     adjusted_target_positions = self._adjusted_target_positions[i]  # NEW
 
+                    # Select high-entropy steps if entropy filtering is enabled
+                    if self.entropy_filter and token_entropy is not None:
+                        # For double batch, we need boundaries too
+                        boundaries = self._all_step_boundaries[i]
+                        selected_steps = self._select_high_entropy_steps(
+                            token_entropy=token_entropy[i],
+                            boundaries=boundaries,
+                            top_k=self.entropy_top_k,
+                            context_window_size=self.entropy_context_window
+                        )
+
+                        # Debug output
+                        if self.debug >= 5 and torch.cuda.current_device() == 0:
+                            print(f"\n[ENTROPY FILTER] Sample {i} (double batch):")
+                            print(f"  Total steps: {num_pairs}")
+                            print(f"  Selected high-entropy steps: {selected_steps}")
+
+                            # Show entropy values for each step
+                            for step_idx in range(num_pairs):
+                                boundary_pos = boundaries[step_idx]
+                                max_entropy = self._get_step_max_entropy(
+                                    token_entropy[i],
+                                    boundary_pos,
+                                    self.entropy_context_window
+                                )
+                                marker = "✓" if step_idx in selected_steps else "✗"
+                                print(f"  Step {step_idx}: boundary={boundary_pos}, max_entropy={max_entropy:.4f} {marker}")
+                    else:
+                        # Use all steps (no filtering)
+                        selected_steps = list(range(num_pairs))
+
                     for pair_idx in range(num_pairs):
+                        # Filter: only compute JEPA loss for selected high-entropy steps
+                        if pair_idx not in selected_steps:
+                            continue
                         pred_pos = predictor_positions[pair_idx]
                         pred_emb = batch2_hidden[i, pred_pos, :]
 
