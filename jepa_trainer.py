@@ -105,8 +105,8 @@ class JepaTrainer(Trainer):
 
         if not os.path.exists(path):
             print(f"WARNING: nn_tokens.json not found at {path}, using fallback")
-            # Fallback: common tokens for Llama-3.2
-            return [1473, 2595, 45464, 35432, 2266, 43115, 95181, 271, 57277, 7887, 9456, 1363, 2195, 696, 15804, 1980, 3677, 382]
+            # Fallback: common tokens for Llama-3.2 (return as SET for fast lookup)
+            return set([271, 382, 627])  # Common "\n\n" token IDs
 
         with open(path, 'r') as f:
             data = json.load(f)
@@ -284,13 +284,23 @@ class JepaTrainer(Trainer):
                 return None
 
         # Search for "\\n\\n" ONLY within assistant span
-        # Use precomputed token set 
+        # Use precomputed token set
         occ = []
 
+        # DEBUG: Print nn_token_ids once
+        if self.debug >= 5 and not hasattr(self, '_printed_nn_tokens'):
+            self._printed_nn_tokens = True
+            print(f"\n[DEBUG] nn_token_ids loaded: {sorted(list(self.nn_token_ids))}")
+            print(f"[DEBUG] Number of nn tokens: {len(self.nn_token_ids)}")
+
         for i in range(assistant_start, assistant_end):
-            # Simple set membership check (very fast!)
             if ids[i] in self.nn_token_ids:
                 occ.append(i)  # Found a token containing "\n\n"
+
+                # DEBUG: Print when found
+                if self.debug >= 5 and len(occ) <= 3:
+                    token_text = tokenizer.decode([ids[i]], skip_special_tokens=False)
+                    print(f"[DEBUG] Found separator at pos={i}: token_id={ids[i]}, text={repr(token_text)}")
 
                 # Only need num_steps - 1 separators
                 if len(occ) >= num_steps - 1:
@@ -336,11 +346,19 @@ class JepaTrainer(Trainer):
         if self.print_nn_positions:
             self._debug_print_nn(tokenizer, input_ids, assistant_start, assistant_end, sample_idx=-1)
 
-        # Need at least num_steps boundaries to form prediction pairs
-        if len(adjusted_occ) < num_steps:
+        # Return all boundaries found (even if less than num_steps requested)
+        # Caller will use min(found_steps, num_prediction_steps) for training
+        if len(adjusted_occ) < 2:
+            # Need at least 2 boundaries to form 1 prediction pair
+            if self.debug >= 5 and torch.cuda.current_device() == 0:
+                print(f"[DEBUG] _find_step_boundaries returning None: found only {len(adjusted_occ)} boundaries, need at least 2")
+                print(f"[DEBUG]   assistant_span=[{assistant_start}, {assistant_end}]")
             return None
 
-        return adjusted_occ  # Return adjusted list
+        if self.debug >= 5 and torch.cuda.current_device() == 0 and len(adjusted_occ) < num_steps:
+            print(f"[DEBUG] Found {len(adjusted_occ)} boundaries (requested {num_steps}), will use all available")
+
+        return adjusted_occ  # Return all boundaries found
 
     def _find_view_boundaries(self, input_ids, labels, user_span=None, assistant_span=None):
         """
@@ -377,6 +395,7 @@ class JepaTrainer(Trainer):
         # Find boundaries for each example (mode-dependent)
         view1_end_positions = []  # step1_end or user_end
         view2_end_positions = []  # step2_end or assistant_end
+        all_assistant_spans = []  # Store assistant spans for debug
 
         for i in range(batch_size):
             # Extract spans for this sample
@@ -387,6 +406,9 @@ class JepaTrainer(Trainer):
                 user_span = (user_spans[i][0].item(), user_spans[i][1].item())
             if assistant_spans is not None:
                 assistant_span = (assistant_spans[i][0].item(), assistant_spans[i][1].item())
+
+            # Store for debug
+            all_assistant_spans.append(assistant_span)
 
             if self.view_based_jepa:
                 # View-based mode: view1 = user_end, view2 = assistant_end
@@ -546,6 +568,7 @@ class JepaTrainer(Trainer):
         self._view1_end_pos = view1_end_pos
         self._view2_end_pos = view2_end_pos + self.step_jepa_predictors  # Adjusted for inserted tokens
         self._predictor_pos = view1_end_pos + self.step_jepa_predictors  # Last predictor token
+        self._assistant_spans = all_assistant_spans  # For entropy debug
 
         return {
             "input_ids": doubled_input_ids,      # Shape: (batch_size * 2, seq_len)
@@ -568,6 +591,7 @@ class JepaTrainer(Trainer):
         # Find view boundaries
         view1_end_pos = []
         view2_end_pos = []
+        all_assistant_spans = []  # Store assistant spans for debug
 
         for i in range(batch_size):
             user_span = None
@@ -576,6 +600,9 @@ class JepaTrainer(Trainer):
                 user_span = (user_spans[i][0].item(), user_spans[i][1].item())
             if assistant_spans is not None:
                 assistant_span = (assistant_spans[i][0].item(), assistant_spans[i][1].item())
+
+            # Store for debug
+            all_assistant_spans.append(assistant_span)
 
             # Find view boundaries (reuse existing logic)
             if self.view_based_jepa:
@@ -710,6 +737,7 @@ class JepaTrainer(Trainer):
         self._view1_end_pos = torch.tensor(view1_end_pos, device=device)
         self._view2_end_pos = torch.tensor(view2_end_pos, device=device) + self.step_jepa_predictors
         self._predictor_pos = torch.tensor(view1_end_pos, device=device) + self.step_jepa_predictors
+        self._assistant_spans = all_assistant_spans  # For entropy debug
 
         # Double batch
         doubled_input_ids = torch.cat([batch1_input_ids, batch2_input_ids], dim=0)
@@ -790,6 +818,7 @@ class JepaTrainer(Trainer):
         # Find step boundaries for each sample
         all_step_boundaries = []  # List of lists
         num_pairs_per_sample = []  # Track how many prediction pairs each sample has
+        all_assistant_spans = []  # Store assistant spans for debug
 
         for i in range(batch_size):
             # Extract spans for this sample
@@ -800,6 +829,9 @@ class JepaTrainer(Trainer):
                 user_span = (user_spans[i][0].item(), user_spans[i][1].item())
             if assistant_spans is not None:
                 assistant_span = (assistant_spans[i][0].item(), assistant_spans[i][1].item())
+
+            # Store for debug
+            all_assistant_spans.append(assistant_span)
 
             # Find up to num_prediction_steps + 1 boundaries
             boundaries = self._find_step_boundaries(
@@ -974,6 +1006,7 @@ class JepaTrainer(Trainer):
         self._all_step_boundaries = all_step_boundaries
         self._predictor_positions = predictor_positions_list
         self._num_pairs_per_sample = num_pairs_per_sample
+        self._assistant_spans = all_assistant_spans  # For entropy debug
 
         # Triple batch
         tripled_input_ids = torch.cat([batch1_input_ids, batch2_input_ids, batch3_input_ids], dim=0)
@@ -1001,6 +1034,7 @@ class JepaTrainer(Trainer):
         # === Find step boundaries (same as triple batch) ===
         all_step_boundaries = []
         num_pairs_per_sample = []
+        all_assistant_spans = []  # Store assistant spans for debug
 
         for i in range(batch_size):
             user_span = None
@@ -1009,6 +1043,9 @@ class JepaTrainer(Trainer):
                 user_span = (user_spans[i][0].item(), user_spans[i][1].item())
             if assistant_spans is not None:
                 assistant_span = (assistant_spans[i][0].item(), assistant_spans[i][1].item())
+
+            # Store for debug
+            all_assistant_spans.append(assistant_span)
 
             # Find boundaries
             boundaries = self._find_step_boundaries(
@@ -1160,6 +1197,7 @@ class JepaTrainer(Trainer):
         self._predictor_positions = predictor_positions_list
         self._adjusted_target_positions = adjusted_target_positions_list  # NEW
         self._num_pairs_per_sample = num_pairs_per_sample
+        self._assistant_spans = all_assistant_spans  # For entropy debug
 
         # Double batch (not triple)
         doubled_input_ids = torch.cat([batch1_input_ids, batch2_input_ids], dim=0)
@@ -1377,11 +1415,16 @@ class JepaTrainer(Trainer):
 
                         # Debug output
                         if self.debug >= 5 and torch.cuda.current_device() == 0:
+                            # Get assistant span for validation
+                            assistant_span = self._assistant_spans[i] if hasattr(self, '_assistant_spans') else None
+
                             print(f"\n[ENTROPY FILTER] Sample {i} (triple batch):")
+                            if assistant_span is not None:
+                                print(f"  Assistant span: [{assistant_span[0]}, {assistant_span[1]}]")
                             print(f"  Total steps: {num_pairs}")
                             print(f"  Selected high-entropy steps: {selected_steps}")
 
-                            # Show entropy values for each step
+                            # Show entropy values and context for each step
                             for step_idx in range(num_pairs):
                                 boundary_pos = boundaries[step_idx]
                                 max_entropy = self._get_step_max_entropy(
@@ -1390,7 +1433,29 @@ class JepaTrainer(Trainer):
                                     self.entropy_context_window
                                 )
                                 marker = "✓" if step_idx in selected_steps else "✗"
-                                print(f"  Step {step_idx}: boundary={boundary_pos}, max_entropy={max_entropy:.4f} {marker}")
+
+                                # Check if boundary is in assistant span
+                                in_span = "✓" if assistant_span is None else \
+                                          ("✓" if assistant_span[0] <= boundary_pos <= assistant_span[1] else "✗ OUTSIDE")
+
+                                print(f"  Step {step_idx}: boundary={boundary_pos} (in_span:{in_span}), max_entropy={max_entropy:.4f} {marker}")
+
+                                # Decode context window around boundary
+                                context_size = 5  # Show ±5 tokens
+                                seq_len = main_outputs.logits.shape[1]
+                                window_start = max(0, boundary_pos - context_size)
+                                window_end = min(seq_len, boundary_pos + context_size + 1)
+
+                                # Get input_ids for this sample (from batch 1, original sequence)
+                                sample_input_ids = forward_results['main_outputs'].input_ids[i] if hasattr(forward_results['main_outputs'], 'input_ids') else inputs['input_ids'][i]
+                                context_ids = sample_input_ids[window_start:window_end].tolist()
+                                context_text = self.processing_class.decode(context_ids, skip_special_tokens=False)
+
+                                # Decode boundary token
+                                boundary_token = self.processing_class.decode([sample_input_ids[boundary_pos].item()], skip_special_tokens=False)
+
+                                print(f"    Context [{window_start}:{window_end}]: {repr(context_text)}")
+                                print(f"    Boundary token: {repr(boundary_token)}")
                     else:
                         # Use all steps (no filtering)
                         selected_steps = list(range(num_pairs))
@@ -1449,11 +1514,16 @@ class JepaTrainer(Trainer):
 
                         # Debug output
                         if self.debug >= 5 and torch.cuda.current_device() == 0:
+                            # Get assistant span for validation
+                            assistant_span = self._assistant_spans[i] if hasattr(self, '_assistant_spans') else None
+
                             print(f"\n[ENTROPY FILTER] Sample {i} (double batch):")
+                            if assistant_span is not None:
+                                print(f"  Assistant span: [{assistant_span[0]}, {assistant_span[1]}]")
                             print(f"  Total steps: {num_pairs}")
                             print(f"  Selected high-entropy steps: {selected_steps}")
 
-                            # Show entropy values for each step
+                            # Show entropy values and context for each step
                             for step_idx in range(num_pairs):
                                 boundary_pos = boundaries[step_idx]
                                 max_entropy = self._get_step_max_entropy(
@@ -1462,7 +1532,29 @@ class JepaTrainer(Trainer):
                                     self.entropy_context_window
                                 )
                                 marker = "✓" if step_idx in selected_steps else "✗"
-                                print(f"  Step {step_idx}: boundary={boundary_pos}, max_entropy={max_entropy:.4f} {marker}")
+
+                                # Check if boundary is in assistant span
+                                in_span = "✓" if assistant_span is None else \
+                                          ("✓" if assistant_span[0] <= boundary_pos <= assistant_span[1] else "✗ OUTSIDE")
+
+                                print(f"  Step {step_idx}: boundary={boundary_pos} (in_span:{in_span}), max_entropy={max_entropy:.4f} {marker}")
+
+                                # Decode context window around boundary
+                                context_size = 5  # Show ±5 tokens
+                                seq_len = main_outputs.logits.shape[1]
+                                window_start = max(0, boundary_pos - context_size)
+                                window_end = min(seq_len, boundary_pos + context_size + 1)
+
+                                # Get input_ids for this sample
+                                sample_input_ids = forward_results['main_outputs'].input_ids[i] if hasattr(forward_results['main_outputs'], 'input_ids') else inputs['input_ids'][i]
+                                context_ids = sample_input_ids[window_start:window_end].tolist()
+                                context_text = self.processing_class.decode(context_ids, skip_special_tokens=False)
+
+                                # Decode boundary token
+                                boundary_token = self.processing_class.decode([sample_input_ids[boundary_pos].item()], skip_special_tokens=False)
+
+                                print(f"    Context [{window_start}:{window_end}]: {repr(context_text)}")
+                                print(f"    Boundary token: {repr(boundary_token)}")
                     else:
                         # Use all steps (no filtering)
                         selected_steps = list(range(num_pairs))
